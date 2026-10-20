@@ -1,3 +1,9 @@
+> **Card Brave fork.** This is Card Brave's fork of
+> [HanClinto/CollectorVision](https://github.com/HanClinto/CollectorVision), distributed
+> under the same AGPL-3.0-or-later license. Our changes live in [`service/`](service/), a
+> card identification HTTP service; files we added or changed carry a
+> "Modified by Card Brave" notice. Upstream documentation follows unchanged.
+
 # CollectorVision
 
 Card identification library for collectible card games. Feed it a photo, get back a card identity.
