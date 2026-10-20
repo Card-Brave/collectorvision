@@ -22,9 +22,12 @@ RUN pip install ".[hf]" onnxruntime ./service
 # Bake models and catalog snapshots into the image so the container starts
 # offline and every replica serves the same catalog version.
 ARG CV_CATALOGS=mtg
-RUN CV_CATALOGS=${CV_CATALOGS} CV_ALLOW_UNAUTHENTICATED=1 python -c "\
-from collectorvision_service import Pipeline, Settings; \
-Pipeline(Settings.from_env())"
+# Retried because the catalog feed download occasionally times out.
+RUN for attempt in 1 2 3; do \
+      CV_CATALOGS=${CV_CATALOGS} CV_ALLOW_UNAUTHENTICATED=1 python -c \
+        "from collectorvision_service import Pipeline, Settings; Pipeline(Settings.from_env())" \
+      && exit 0; echo "catalog download attempt $attempt failed"; sleep 10; \
+    done; exit 1
 
 RUN useradd --system --uid 10001 vision && chown -R vision /opt/collectorvision-cache
 USER vision
