@@ -73,6 +73,9 @@ Other endpoints: `GET /healthz`, `GET /readyz`, `GET /source`, `GET /v1/info`
 |---|---|---|
 | `CV_TOKEN` | — | Shared bearer token (required unless `CV_ALLOW_UNAUTHENTICATED=1`). |
 | `CV_CATALOGS` | `mtg` | Comma-separated games, optionally `game:source` (e.g. `mtg:tcgplayer`). |
+
+The Docker image bakes `mtg,pokemon,riftbound` by default; override with
+`--build-arg CV_CATALOGS=...` (any game in `collector_vision/games.py`).
 | `CV_PROVIDER` | `cpu` | ONNX Runtime provider: `cpu`, `gpu`, or `auto`. |
 | `CV_THREADS` | `4` | ONNX Runtime threads per model. |
 | `CV_MAX_CONCURRENCY` | `2` | Requests processed at once; others wait up to 30 s, then 503. |

@@ -21,7 +21,7 @@ RUN pip install ".[hf]" onnxruntime ./service
 
 # Bake models and catalog snapshots into the image so the container starts
 # offline and every replica serves the same catalog version.
-ARG CV_CATALOGS=mtg
+ARG CV_CATALOGS=mtg,pokemon,riftbound
 # Retried because the catalog feed download occasionally times out.
 RUN for attempt in 1 2 3; do \
       CV_CATALOGS=${CV_CATALOGS} CV_ALLOW_UNAUTHENTICATED=1 python -c \
