@@ -16,6 +16,9 @@ dependencies = [
     "uvicorn[standard]>=0.29",
 ]
 
+[project.scripts]
+cv-catalog = "collectorvision_service.local_catalog:main"
+
 [project.optional-dependencies]
 dev = ["pytest", "httpx>=0.27"]
 

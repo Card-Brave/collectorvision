@@ -7,8 +7,10 @@ rest of this repository.
 from __future__ import annotations
 
 import base64
+import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -16,12 +18,15 @@ import numpy as np
 
 import collector_vision as cvg
 from collector_vision import retrieval
-from collector_vision.catalog_v2 import _MODEL_IDENTITY
 from collector_vision.embedders.neural import NeuralEmbedder
 from collector_vision.model_artifacts import resolve_model_artifact
 from collector_vision.model_registry import get_model
 
 from .config import Settings
+from .local_catalog import LocalCatalog, model_key
+
+
+logger = logging.getLogger("collectorvision_service")
 
 
 class PipelineError(ValueError):
@@ -55,6 +60,11 @@ def _parse_catalog_spec(raw: str) -> tuple[str, str | None]:
     return game.strip(), (source.strip() or None)
 
 
+# A search target: a loaded catalog plus, for local catalogs holding several games,
+# the one game to restrict results to.
+Target = tuple[str, Any, str | None]
+
+
 def _normalize(vector: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(vector))
     return vector / norm if norm else vector
@@ -65,23 +75,35 @@ class Pipeline:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.catalogs: dict[str, cvg.CatalogV2] = {}
+        # Published catalogs ("mtg", "pokemon:tcgplayer") and local catalogs built
+        # from your own images ("cardbrave=/catalogs/cardbrave.npz").
+        self.catalogs: dict[str, Any] = {}
         for raw in settings.catalogs:
+            name, _, path = raw.partition("=")
+            if path:
+                # A local catalog is built after first deploy, so a missing file is
+                # logged and skipped rather than keeping the published catalogs down.
+                if not Path(path.strip()).is_file():
+                    logger.warning("local catalog %s not found at %s; skipping", name.strip(), path.strip())
+                    continue
+                self.catalogs[name.strip()] = LocalCatalog.load(path.strip(), name=name.strip())
+                continue
             game, source = _parse_catalog_spec(raw)
-            catalog = cvg.CatalogV2.load(
+            self.catalogs[game] = cvg.CatalogV2.load(
                 game,
                 source=source,
                 cache_dir=settings.cache_dir,
                 offline=settings.offline,
             )
-            self.catalogs[game] = catalog
         if not self.catalogs:
             raise RuntimeError("No catalogs configured (CV_CATALOGS).")
 
-        models = {catalog.embedding_model for catalog in self.catalogs.values()}
+        # Every catalog must come from the same model, or one query embedding cannot
+        # search them all. Published identities also name the publishing commit.
+        models = {model_key(catalog.embedding_model) for catalog in self.catalogs.values()}
         if len(models) != 1:
             raise RuntimeError(f"Loaded catalogs use different embedding models: {sorted(models)}")
-        self.embedding_model = models.pop()
+        self.embedding_model = next(iter(self.catalogs.values())).embedding_model
         self.embedder = self._build_embedder(self.embedding_model)
         self.detector = cvg.NeuralCornerDetector(
             num_threads=settings.threads, provider=settings.provider
@@ -90,11 +112,9 @@ class Pipeline:
     def _build_embedder(self, identity: str) -> NeuralEmbedder:
         # Same resolution as CatalogV2.embedder, but honouring the configured provider
         # (CoreML/accelerator sessions can fail at runtime on some hosts).
-        match = _MODEL_IDENTITY.fullmatch(identity)
-        if match is None:
-            raise RuntimeError(f"Unsupported embedding model {identity!r}")
-        model = get_model(match.group("model"))
-        if model.sha256 != match.group("sha256"):
+        name, sha256 = model_key(identity)
+        model = get_model(name)
+        if model.sha256 != sha256:
             raise RuntimeError(f"Installed model registry does not match {identity!r}")
         checkpoint = resolve_model_artifact(model, cache_dir=self.settings.cache_dir)
         return NeuralEmbedder(
@@ -117,6 +137,7 @@ class Pipeline:
                     "source": catalog.source,
                     "size": len(catalog),
                     "catalog": repr(catalog),
+                    **({"games": catalog.games()} if isinstance(catalog, LocalCatalog) else {}),
                 }
                 for game, catalog in self.catalogs.items()
             },
@@ -126,18 +147,43 @@ class Pipeline:
     # Identification
     # ------------------------------------------------------------------
 
-    def _catalogs_for(self, game: str | None) -> dict[str, cvg.CatalogV2]:
-        if game is None:
-            return self.catalogs
-        if game not in self.catalogs:
-            raise PipelineError(f"Unknown game {game!r}; loaded games: {sorted(self.catalogs)}")
-        return {game: self.catalogs[game]}
+    def games(self) -> list[str]:
+        names = set(self.catalogs)
+        for catalog in self.catalogs.values():
+            if isinstance(catalog, LocalCatalog):
+                names.update(catalog.games())
+        return sorted(names)
 
-    def _best_score(self, catalogs: dict[str, cvg.CatalogV2], vector: np.ndarray) -> float:
-        return max(
-            retrieval.cosine_search(vector, catalog.embeddings, top_k=1)[0][0]
-            for catalog in catalogs.values()
-        )
+    def _targets(self, game: str | None) -> list[Target]:
+        if game is None:
+            return [(name, catalog, None) for name, catalog in self.catalogs.items()]
+        if game in self.catalogs:
+            return [(game, self.catalogs[game], None)]
+        targets = [
+            (name, catalog, game)
+            for name, catalog in self.catalogs.items()
+            if isinstance(catalog, LocalCatalog) and game in catalog.games()
+        ]
+        if not targets:
+            raise PipelineError(f"Unknown game {game!r}; loaded games: {self.games()}")
+        return targets
+
+    @staticmethod
+    def _search(target: Target, vector: np.ndarray, top_k: int) -> list[dict[str, Any]]:
+        _, catalog, game = target
+        if isinstance(catalog, LocalCatalog):
+            return catalog.search_records(vector, top_k=top_k, game=game)
+        return catalog.search_records(vector, top_k=top_k)
+
+    def _best_score(self, targets: list[Target], vector: np.ndarray) -> float:
+        scores = []
+        for target in targets:
+            catalog = target[1]
+            if isinstance(catalog, LocalCatalog):
+                scores.append(catalog.best_score(vector, game=target[2]))
+            else:
+                scores.append(retrieval.cosine_search(vector, catalog.embeddings, top_k=1)[0][0])
+        return max(scores)
 
     def decode(self, data: bytes) -> np.ndarray:
         settings = self.settings
@@ -160,7 +206,7 @@ class Pipeline:
             bgr = cv2.resize(bgr, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA)
         return bgr
 
-    def _frame(self, bgr: np.ndarray, catalogs: dict[str, cvg.CatalogV2]) -> FrameResult:
+    def _frame(self, bgr: np.ndarray, catalogs: list[Target]) -> FrameResult:
         detection = self.detector.detect(bgr, min_sharpness=self.settings.min_sharpness)
         if not detection.card_present or detection.corners is None:
             return FrameResult(card_present=False, sharpness=detection.sharpness)
@@ -199,7 +245,7 @@ class Pipeline:
         top_k = top_k or settings.top_k
         if not 1 <= top_k <= settings.max_top_k:
             raise PipelineError(f"top_k must be between 1 and {settings.max_top_k}")
-        catalogs = self._catalogs_for(game)
+        catalogs = self._targets(game)
 
         frames = [self._frame(self.decode(data), catalogs) for data in images]
         present = [frame for frame in frames if frame.card_present]
@@ -224,8 +270,9 @@ class Pipeline:
         query = _normalize(np.stack([frame.embedding for frame in agreeing]).mean(axis=0))
 
         hits: list[dict[str, Any]] = []
-        for name, catalog in catalogs.items():
-            for record in catalog.search_records(query, top_k=top_k):
+        for target in catalogs:
+            name, catalog, _ = target
+            for record in self._search(target, query, top_k):
                 hits.append(_candidate(name, catalog.source, record))
         hits.sort(key=lambda hit: hit["score"], reverse=True)
         hits = hits[:top_k]
@@ -255,7 +302,9 @@ def _candidate(game: str, source: str, record: dict[str, Any]) -> dict[str, Any]
     return {
         "score": round(float(record["score"]), 4),
         "id": record["id"],
-        "game": game,
+        # Local catalogs can hold several games; each row names its own.
+        "game": metadata.get("game") or game,
+        "catalog": game,
         "source": source,
         "name": record.get("name"),
         "identifiers": record.get("identifiers") or {},

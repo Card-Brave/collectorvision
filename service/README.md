@@ -72,7 +72,7 @@ Other endpoints: `GET /healthz`, `GET /readyz`, `GET /source`, `GET /v1/info`
 | Variable | Default | Purpose |
 |---|---|---|
 | `CV_TOKEN` | — | Shared bearer token (required unless `CV_ALLOW_UNAUTHENTICATED=1`). |
-| `CV_CATALOGS` | `mtg` | Comma-separated games, optionally `game:source` (e.g. `mtg:tcgplayer`). |
+| `CV_CATALOGS` | `mtg` | Comma-separated games, optionally `game:source` (e.g. `mtg:tcgplayer`), and local catalogs as `name=/path/catalog.npz` (skipped with a warning if the file is missing). |
 
 The Docker image bakes `mtg,pokemon,riftbound` by default; override with
 `--build-arg CV_CATALOGS=...` (any game in `collector_vision/games.py`).
@@ -85,6 +85,31 @@ The Docker image bakes `mtg,pokemon,riftbound` by default; override with
 | `CV_AMBIGUITY_MARGIN` | `0.03` | `ambiguous` when top-1 minus top-2 is below this. |
 | `CV_MAX_FRAMES` / `CV_MAX_IMAGE_BYTES` / `CV_MAX_SIDE` | `8` / 10 MiB / `1600` | Input limits. |
 | `CV_SOURCE_URL` | this fork | Source link served for AGPL §13. Point it at your fork if you modify it. |
+
+## Local catalogs
+
+Recognize any card you have reference images for, returning your own IDs. Write a
+manifest with one JSON object per line (`id` is required; `image` defaults to
+`<id>.jpg`; `game`, `name`, `set`, `set_name`, `collector_number`, `lang`,
+`finishes`, and `promo` are returned with results):
+
+```json
+{"id": "printing-123", "image": "printing-123.jpg", "game": "azuki-tcg", "name": "Penny", "collector_number": "001"}
+```
+
+Build and load it:
+
+```bash
+cv-catalog build --manifest refs/manifest.jsonl --images refs/images \
+  --name mystore --out catalogs/mystore.npz
+CV_CATALOGS=mtg,mystore=catalogs/mystore.npz python -m collectorvision_service
+```
+
+Embeddings use the same Milo model as the published catalogs, so one scan searches
+both. Results carry `identifiers: {"mystore": "<id>"}` and the row's `game`. A
+request's `game` may name a published catalog or any game inside a local catalog;
+`GET /v1/info` lists them. Milo was trained on Magic cards; test new games with
+your own photos before trusting the results.
 
 ## Run
 
